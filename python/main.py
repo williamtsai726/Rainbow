@@ -72,18 +72,18 @@ def connect_rby1(address: str, model: str = "a", no_head: bool = False):
     logging.info("Successfully connected to RB-Y1.")
 
     servo_pattern = "^(?!head_).*" if no_head else ".*"
-    if not robot.is_power_on(servo_pattern):
+    if not robot.is_power_on(".*"):
         logging.warning("Robot power is off. Turning it on...")
-        if not robot.power_on(servo_pattern):
+        if not robot.power_on(".*"):
             logging.critical("Failed to power on. Exiting program.")
             exit(1)
         logging.info("Power turned on successfully.")
     else:
         logging.info("Power is already on.")
 
-    if not robot.is_servo_on(".*"):
+    if not robot.is_servo_on(servo_pattern):
         logging.warning("Servo is off. Turning it on...")
-        if not robot.servo_on(".*"):
+        if not robot.servo_on(servo_pattern):
             logging.critical("Failed to turn on the servo. Exiting program.")
             exit(1)
         logging.info("Servo turned on successfully.")
@@ -260,6 +260,7 @@ def main(args: argparse.Namespace):
         gripper = Gripper()
         if not gripper.initialize(verbose=True):
             exit(1)
+        time.sleep(0.3)
         gripper.homing()
         gripper.start()
         gripper.set_normalized_target(np.array([0.0, 0.0]))
