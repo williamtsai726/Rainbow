@@ -1,0 +1,51 @@
+sensors:
+  cameras:
+    left_camera:
+      device_id: "323622272154"
+    front_camera:
+      device_id: "234222300666"
+    right_camera:
+      device_id: "335122270697"
+
+# Data collection configuration
+collection:
+  max_episode_length: 10000
+  act_noise_std: 0.001
+  no_ops_threshold: 0.004
+  no_ops_last_detected_time: 3
+  lock_rotation_detected_time: 1
+
+# Data storage configuration
+storage:
+  episodes: 2
+  base_dir: "/home/nvidia/repo/rby1-examples-vr-teleop/data"
+  task_directory: "reopen_the_drawer"
+  language_instruction: "Reopen the drawer"
+  teleop_device: "oculus" # ["oculus", "keyboard", "gello", "none"]
+  save_format: "json" # ["json", "npy"]
+  saver_max_workers: 2
+  png_compress_level: 1
+  old_format: false
+
+# LeRobot conversion + upload pipeline
+lerobot:
+  auto_convert: true
+  auto_upload: true
+  hf_repo_id: "williamtsai726/reopen_the_drawer_0312"
+  delete_local_after_upload: true
+  fps: 30
+  robot_type: "molmoact_dual_arm"
+  skip_initial_frames: 0
+  action_mode: "next_joint_fields" # ["next_joint_fields", "next_state", "copy_state"]
+  vcodec: "h264"
+  image_writer_processes: 8
+  image_writer_threads: 8
+  parallel_encoding: true
+  sanitize_online_viz_meta: true
+
+# Policy configuration
+policy:
+  # _target_: lerobot.policies.pi05.configuration_pi05.PI05Config
+  type: "pi05"
+  repo_id: "williamtsai726/stack_four_0310"
+  checkpoint_path: "Jiafei1224/pi-05-cube4"
