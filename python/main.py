@@ -28,7 +28,7 @@ T_conv = np.array([
 
 @dataclass(frozen=True)
 class Settings:
-    dt: float = 0.1
+    dt: float = 0.033
     hand_offset: float = np.array([0.0, 0.0, 0.0])
 
     T_hand_offset = np.identity(4)
@@ -278,7 +278,9 @@ def main(args: argparse.Namespace):
     torso_reset = False
     right_reset = False
     left_reset = False
+    now = 0
     while True:
+        logging.info(f"Loop execution time: {time.monotonic() - now:.4f}s")
         now = time.monotonic()
         if now < next_time:
             time.sleep(next_time - now)
@@ -533,7 +535,7 @@ def main(args: argparse.Namespace):
 
                     ctrl_builder = (
                         rby.BodyComponentBasedCommandBuilder()
-                        .set_torso_command(torso_builder)
+                        # .set_torso_command(torso_builder)
                         .set_right_arm_command(right_builder)
                         .set_left_arm_command(left_builder)
                     )
@@ -545,19 +547,19 @@ def main(args: argparse.Namespace):
                 stream.send_command(
                     rby.RobotCommandBuilder().set_command(
                         rby.ComponentBasedCommandBuilder()
-                        .set_head_command(
-                            rby.JointPositionCommandBuilder()
-                            .set_command_header(rby.CommandHeaderBuilder().set_control_hold_time(Settings.dt * 10))
-                            .set_position([float(yaw), float(pitch)])
-                            .set_minimum_time(Settings.dt * 1.01)
-                        )
-                        .set_mobility_command(
-                            rby.SE2VelocityCommandBuilder()
-                            .set_command_header(rby.CommandHeaderBuilder().set_control_hold_time(Settings.dt * 10))
-                            .set_velocity(-SystemContext.vr_state.mobile_linear_velocity,
-                                          -SystemContext.vr_state.mobile_angular_velocity)
-                            .set_minimum_time(Settings.dt * 1.01)
-                        )
+                        # .set_head_command(
+                        #     rby.JointPositionCommandBuilder()
+                        #     .set_command_header(rby.CommandHeaderBuilder().set_control_hold_time(Settings.dt * 10))
+                        #     .set_position([float(yaw), float(pitch)])
+                        #     .set_minimum_time(Settings.dt * 1.01)
+                        # )
+                        # .set_mobility_command(
+                        #     rby.SE2VelocityCommandBuilder()
+                        #     .set_command_header(rby.CommandHeaderBuilder().set_control_hold_time(Settings.dt * 10))
+                        #     .set_velocity(-SystemContext.vr_state.mobile_linear_velocity,
+                        #                   -SystemContext.vr_state.mobile_angular_velocity)
+                        #     .set_minimum_time(Settings.dt * 1.01)
+                        # )
                         .set_body_command(
                             ctrl_builder
                         )
@@ -595,8 +597,8 @@ if __name__ == "__main__":
         help="gRPC address of the RB-Y1 robot (default: 192.168.30.1:50051)"
     )
     parser.add_argument(
-        "--rby1_model", default="a", type=str,
-        help="Model type of the RB-Y1 robot (default: a)"
+        "--rby1_model", default="m", type=str,
+        help="Model type of the RB-Y1 robot (default: m)"
     )
     parser.add_argument(
         "--no_head", action="store_true", 

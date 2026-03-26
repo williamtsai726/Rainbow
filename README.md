@@ -99,11 +99,11 @@ pip install rby1-sdk==0.7.0 pyzmq>=26.4.0,<27.0.0 scipy>=1.15.3,<2.0.0
 
 ```bash
 python main.py \
-  --local_ip 192.168.***.*** \
-  --meta_quest_ip 192.168.***.*** \
+  --local_ip 172.16.120.136 \
+  --meta_quest_ip 172.16.120.168 \
   --rby1 192.168.30.1:50051 \
-  --rby1_model "a" \
-  --no_gripper
+  --rby1_model "m" \
+  --no_head
 ```
 
 #### Option Descriptions
