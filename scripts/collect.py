@@ -4,6 +4,8 @@ import zmq
 import time
 import threading
 from dataclasses import dataclass
+from pathlib import Path
+import sys
 import rby1_sdk as rby
 import socket
 from typing import Union
@@ -17,6 +19,12 @@ import pickle
 logging.basicConfig(
     level=logging.INFO, format="%(asctime)s - %(levelname)-8s - %(message)s"
 )
+
+# Ensure repo root is on PYTHONPATH so imports like `camera.realsense_camera` work
+# even when you run `python scripts/data_collect.py` from within `scripts/`.
+_REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
 
 T_conv = np.array([
     [0, -1, 0, 0],
@@ -234,8 +242,40 @@ def publish_gv(sock: zmq.Socket):
         sock.send(pickle.dumps(SystemContext.vr_state))
         time.sleep(0.1)
 
+from omegaconf import OmegaConf
+from camera.realsense_camera import RealSenseCamera, get_device_ids
+from data_utils.data_saver import DataSaver
+from data_utils.data_saver_thread import EpisodeSaverThread
 
 def main(args: argparse.Namespace):
+    ids = get_device_ids()
+    print(f"Found {len(ids)} camera devices")
+    print(ids)
+
+    # Load configs
+    config_path = args.config_path
+    config_path = str(Path(config_path).expanduser().resolve())
+    cfg = OmegaConf.to_container(
+        OmegaConf.load(config_path), resolve=True
+    )
+
+    # Initialize data saver and keyboard interface
+    data_saver = DataSaver(
+        save_dir=cfg["storage"]["base_dir"],
+        task_directory=cfg["storage"]["task_directory"],
+        language_instruction=cfg["storage"]["language_instruction"],
+        saver_max_workers=cfg["storage"].get("saver_max_workers"),
+        png_compress_level=cfg["storage"].get("png_compress_level", 1),
+    )
+
+    camera_cfg = cfg["sensors"]["cameras"]
+    cameras = {
+        "left_camera": RealSenseCamera(camera_cfg["left_camera"]["device_id"]),
+        "front_camera": RealSenseCamera(camera_cfg["front_camera"]["device_id"]),
+        "right_camera": RealSenseCamera(camera_cfg["right_camera"]["device_id"]),
+    }
+
+
     logging.info("=== VR Control System Starting ===")
     logging.info(f"Server Address       : {args.server}")
     logging.info(f"Local (UPC) IP       : {args.local_ip}:{Settings.vr_control_local_port}")
@@ -273,18 +313,151 @@ def main(args: argparse.Namespace):
                                      SystemContext.robot_model.robot_joint_names)
     base_link_idx, link_torso_5_idx, link_right_arm_6_idx, link_left_arm_6_idx = 0, 1, 2, 3
 
+    joint_names = list(SystemContext.robot_model.robot_joint_names)
+    left_arm_joint_indices = [i for i, name in enumerate(joint_names) if name.startswith("left_arm")]
+    right_arm_joint_indices = [i for i, name in enumerate(joint_names) if name.startswith("right_arm")]
+
+    if len(left_arm_joint_indices) != 7 or len(right_arm_joint_indices) != 7:
+        logging.warning(
+            "Expected 7 left/right arm joints, got "
+            f"left={len(left_arm_joint_indices)} right={len(right_arm_joint_indices)}. "
+            "Joint extraction may be incorrect."
+        )
+
+    def extract_left_right_arm_joints(q_full: np.ndarray) -> np.ndarray:
+        # DataSaver expects a (14,) vector: left[0:7] + right[7:14]
+        left_q = q_full[left_arm_joint_indices]
+        right_q = q_full[right_arm_joint_indices]
+        # Defensive slicing: some robot models may expose extra joints; keep the first 7.
+        if left_q.shape[0] > 7:
+            left_q = left_q[:7]
+        if right_q.shape[0] > 7:
+            right_q = right_q[:7]
+        return np.concatenate([left_q, right_q]).astype(np.float32)
+
+    def move_robot_to_ready_pose():
+        # Matches the existing ready pose used in the prior VR-button-based flow.
+        if robot.get_control_manager_state().control_state != rby.ControlManagerState.ControlState.Idle:
+            robot.cancel_control()
+        if robot.wait_for_control_ready(1000):
+            ready_pose = np.deg2rad(
+                [0.0, 45.0, -90.0, 45.0, 0.0, 0.0]
+                + [0.0, -15.0, 0.0, -120.0, 0.0, 70.0, 0.0]
+                + [0.0, 15.0, 0.0, -120.0, 0.0, 70.0, 0.0]
+            )
+            cbc = (
+                rby.ComponentBasedCommandBuilder()
+                .set_body_command(
+                    rby.JointImpedanceControlCommandBuilder()
+                    .set_command_header(rby.CommandHeaderBuilder().set_control_hold_time(1))
+                    .set_position(ready_pose)
+                    .set_stiffness([400.] * 6 + [60] * 7 + [60] * 7)
+                    .set_torque_limit([500] * 6 + [30] * 7 + [30] * 7)
+                    .set_minimum_time(2)
+                )
+            )
+            if not args.no_head:
+                cbc.set_head_command(
+                    rby.JointPositionCommandBuilder()
+                    .set_position([0.] * len(SystemContext.robot_model.head_idx))
+                    .set_minimum_time(2)
+                )
+            robot.send_command(rby.RobotCommandBuilder().set_command(cbc)).get()
+
+    max_episode_length = int(cfg["collection"]["max_episode_length"])
+    episode_frame_count = 0  # raw frames, not observations (observations start on frame 2)
+    prev_capture = None  # last frame observation payload (without next_joint)
+    last_arm_joints = None
+    latest_dashboard_cameras = {"left_camera": None, "front_camera": None, "right_camera": None}
+
     next_time = time.monotonic()
     stream = None
     torso_reset = False
     right_reset = False
     left_reset = False
     now = 0
+    right_primary_prev = False
+    right_secondary_prev = False
+    num_traj = data_saver.traj_count if data_saver.traj_count > 0 else 1
+    saver_thread = EpisodeSaverThread(data_saver)
+    saver_thread.start()
+    move_robot_to_ready_pose()
     while True:
-        logging.info(f"Loop execution time: {time.monotonic() - now:.4f}s")
+        # logging.info(f"Loop execution time: {time.monotonic() - now:.4f}s")
         now = time.monotonic()
         if now < next_time:
             time.sleep(next_time - now)
         next_time += Settings.dt
+
+        # --- Episode control via VR controller A/B ---
+        if num_traj > cfg["storage"]["episodes"] and not SystemContext.vr_state.is_initialized:
+            logging.info("Reached max episode count; exiting.")
+            break
+
+        right_hand = SystemContext.vr_state.controller_state.get("hands", {}).get("right", {})
+        right_buttons = right_hand.get("buttons", {})
+        right_primary = bool(right_buttons.get("primaryButton", False))
+        right_secondary = bool(right_buttons.get("secondaryButton", False))
+
+        # Rising-edge detection to avoid repeated triggers while holding the button.
+        a_rise = right_primary and not right_primary_prev
+        b_rise = right_secondary and not right_secondary_prev
+        right_primary_prev = right_primary
+        right_secondary_prev = right_secondary
+
+        if b_rise and SystemContext.vr_state.is_initialized:
+            # Stop teleop and discard previously collected episode.
+            logging.info("Right B pressed. Discarding current episode.")
+            if stream is not None:
+                stream.cancel()
+                stream = None
+            SystemContext.vr_state.is_initialized = False
+            SystemContext.vr_state.is_stopped = False
+            move_robot_to_ready_pose()
+            data_saver.reset_buffer()
+            prev_capture = None
+            episode_frame_count = 0
+            last_arm_joints = None
+            latest_dashboard_cameras = {"left_camera": None, "front_camera": None, "right_camera": None}
+            continue
+
+        if a_rise:
+            if not SystemContext.vr_state.is_initialized:
+                # Start teleop + data collection.
+                logging.info("Right A pressed. Starting teleop + data collection for episode {num_traj}.")
+                if stream is not None:
+                    stream.cancel()
+                    stream = None
+                data_saver.reset_buffer()
+                prev_capture = None
+                episode_frame_count = 0
+                last_arm_joints = None
+                latest_dashboard_cameras = {"left_camera": None, "front_camera": None, "right_camera": None}
+                SystemContext.vr_state.is_initialized = True
+                SystemContext.vr_state.is_stopped = False
+                continue
+            else:
+                # Save episode and reset robot to ready pose.
+                logging.info(f"Right A pressed. Saving episode {num_traj} + resetting robot.")
+                if stream is not None:
+                    stream.cancel()
+                    stream = None
+                SystemContext.vr_state.is_initialized = False
+                SystemContext.vr_state.is_stopped = False
+
+                if data_saver.buffer:
+                    saver_thread.save_episode(data_saver.buffer.copy())
+                    num_traj += 1
+                else:
+                    logging.info("No frames collected; skipping save.")
+
+                data_saver.reset_buffer()
+                prev_capture = None
+                episode_frame_count = 0
+                last_arm_joints = None
+                latest_dashboard_cameras = {"left_camera": None, "front_camera": None, "right_camera": None}
+                move_robot_to_ready_pose()
+                continue
 
         if "hands" in SystemContext.vr_state.controller_state:
             if "right" in SystemContext.vr_state.controller_state["hands"]:
@@ -303,19 +476,7 @@ def main(args: argparse.Namespace):
         if SystemContext.vr_state.joint_positions.size == 0:
             continue
 
-        if handle_vr_button_event(robot, args.no_head):
-            if stream is not None:
-                stream.cancel()
-                stream = None
-
         if not SystemContext.vr_state.is_initialized:
-            continue
-
-        if SystemContext.vr_state.is_stopped:
-            if stream is not None:
-                stream.cancel()
-                stream = None
-            SystemContext.vr_state.is_initialized = False
             continue
 
         logging.info(f"{SystemContext.vr_state.center_of_mass = }")
@@ -338,6 +499,39 @@ def main(args: argparse.Namespace):
         pitch = np.atan2(-center[2], center[0]) - np.deg2rad(10)
         yaw = np.clip(yaw, -np.deg2rad(29), np.deg2rad(29))
         pitch = np.clip(pitch, -np.deg2rad(19), np.deg2rad(89))
+
+        # --- Capture camera + joints for the current frame ---
+        try:
+            q_arms = extract_left_right_arm_joints(SystemContext.vr_state.joint_positions)
+            last_arm_joints = q_arms
+
+            left_rgb, _ = cameras["left_camera"].read()
+            front_rgb, _ = cameras["front_camera"].read()
+            right_rgb, _ = cameras["right_camera"].read()
+
+            latest_dashboard_cameras = {
+                "left_camera": left_rgb,
+                "front_camera": front_rgb,
+                "right_camera": right_rgb,
+            }
+
+            current_capture = {
+                "left_camera_rgb": left_rgb,
+                "right_camera_rgb": right_rgb,
+                "front_camera_rgb": front_rgb,
+                "joint_positions": q_arms,
+            }
+
+            # DataSaver.save_episode_json expects obs[t] and label obs[t+1] via `next_joint`.
+            if prev_capture is not None:
+                obs_next = dict(prev_capture)
+                obs_next["next_joint"] = q_arms
+                data_saver.add_observation(obs_next)
+
+            prev_capture = current_capture
+            episode_frame_count += 1
+        except Exception as exc:
+            logging.warning(f"Frame capture failed: {exc}")
 
         # Tracking
         if stream is None:
@@ -570,8 +764,9 @@ def main(args: argparse.Namespace):
                 stream = None
                 exit(1)
 
-        # ...
-
+    saver_thread.stop()
+    saver_thread.join()
+    logging.info("Data collection complete.")
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="RB-Y1 VR Control Launcher")
@@ -607,6 +802,13 @@ if __name__ == "__main__":
     parser.add_argument(
         "--whole_body", action="store_true",
         help="Use a whole-body optimization formulation (single control for all joints)"
+    )
+
+    parser.add_argument(
+        "--config_path",
+        type=str,
+        default=str(Path(__file__).resolve().parents[1] / "config.yaml"),
+        help="Path to config.yaml (default: repo config.yaml)",
     )
 
     args = parser.parse_args()
