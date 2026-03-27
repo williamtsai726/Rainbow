@@ -4,12 +4,12 @@ import json
 import os
 import pickle
 import time
-from typing import Any, Dict, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
-import matplotlib.pyplot as plt
 import numpy as np
 from PIL import Image
 
+from data_utils.ee_pose import matrix44_from_pose6
 from data_utils.logging_utils import log_data_utils, log_demo_data_info, log_replay
 
 try:
@@ -156,6 +156,7 @@ class DataReplayer:
         left_key: str = "left_joint",
         right_key: str = "right_joint",
     ) -> Tuple[np.ndarray, np.ndarray]:
+        """Per-side vectors from JSON: 8 floats (7 arm + 1 gripper) or legacy 7 arm-only."""
         step = self.get_step(step_idx)
         if left_key not in step or right_key not in step:
             raise KeyError(f"Missing keys: {left_key}, {right_key}")
@@ -188,6 +189,8 @@ class DataReplayer:
         left_prefix: str = "left_arm",
         right_prefix: str = "right_arm",
         expected_per_arm: int = 7,
+        left_key: str = "left_joint",
+        right_key: str = "right_joint",
     ) -> np.ndarray:
         left_idx, right_idx = self.resolve_arm_joint_indices(
             joint_names=joint_names,
@@ -195,10 +198,14 @@ class DataReplayer:
             right_prefix=right_prefix,
             expected_per_arm=expected_per_arm,
         )
-        left_joint, right_joint = self.get_step_arm_joints(step_idx)
+        left_joint, right_joint = self.get_step_arm_joints(
+            step_idx, left_key=left_key, right_key=right_key
+        )
+        lu = np.asarray(self._as_float_array(left_joint), dtype=np.float64).reshape(-1)[:7]
+        ru = np.asarray(self._as_float_array(right_joint), dtype=np.float64).reshape(-1)[:7]
         target = np.asarray(current_joint_positions, dtype=np.float64).copy()
-        target[left_idx] = left_joint[: len(left_idx)]
-        target[right_idx] = right_joint[: len(right_idx)]
+        target[left_idx] = lu[: len(left_idx)]
+        target[right_idx] = ru[: len(right_idx)]
         return target
 
     def get_step_camera_images(
@@ -244,6 +251,13 @@ def replay_camera_episode(
     front_key: str = "image_front_rgb",
     right_key: str = "image_right_rgb",
 ):
+    try:
+        import matplotlib.pyplot as plt
+    except ImportError as exc:
+        raise ImportError(
+            "Camera replay requires matplotlib. Install with: pip install matplotlib"
+        ) from exc
+
     if not replayer.demo:
         log_data_utils("No demo steps found for camera replay.", "warning")
         return
@@ -277,62 +291,136 @@ def replay_camera_episode(
     plt.show(block=False)
 
 
-def make_joint_gains(num_joints: int) -> Tuple[Sequence[float], Sequence[float]]:
-    if num_joints >= 20:
-        return [400.0] * 6 + [60.0] * (num_joints - 6), [500.0] * 6 + [30.0] * (num_joints - 6)
-    return [60.0] * num_joints, [30.0] * num_joints
+def _resolve_replay_pose6_keys(replayer: DataReplayer, step_idx: int, joint_source: str) -> Tuple[str, str]:
+    if joint_source == "next":
+        rk, lk = "next_right_ee", "next_left_ee"
+    else:
+        rk, lk = "right_ee", "left_ee"
+    step = replayer.get_step(step_idx)
+    if joint_source == "next" and (rk not in step or lk not in step):
+        return "right_ee", "left_ee"
+    return rk, lk
+
+
+def _validate_ee7_episode(replayer: DataReplayer, joint_source: str) -> None:
+    n = replayer.get_demo_length()
+    for idx in range(n):
+        rk, lk = _resolve_replay_pose6_keys(replayer, idx, joint_source)
+        step = replayer.get_step(idx)
+        for key in (rk, lk):
+            if key not in step:
+                raise KeyError(
+                    f"Step {idx} missing '{key}' (7 floats: pose6 + gripper). "
+                    "Episodes must use right_ee/left_ee (+ next_* when using --joint-source next)."
+                )
+            v = np.asarray(DataReplayer._as_float_array(step[key]), dtype=np.float64).reshape(-1)
+            if v.size != 7:
+                raise ValueError(f"Step {idx} '{key}' must have 7 floats, got {v.size}")
 
 
 def replay_robot_episode(
     robot: Any,
     replayer: DataReplayer,
-    current_joint_positions: np.ndarray,
-    joint_names: Sequence[str],
     dt: float,
-    left_prefix: str = "left_arm",
-    right_prefix: str = "right_arm",
-    expected_per_arm: int = 7,
+    joint_source: str = "current",
     log_every: int = 50,
+    gripper: Any = None,
 ):
+    """Replay arms from JSON using 7 floats per arm: 6-DOF wrist pose + gripper.
+
+    Each of ``right_ee`` / ``left_ee`` (or ``next_right_ee`` / ``next_left_ee`` when
+    ``joint_source=='next'``) is ``[tx, ty, tz, rx, ry, rz, g]``: translation, rotation
+    vector (rad), then gripper ``g`` (1=open / 0=close).
+    """
     if rby is None:
         raise RuntimeError("rby1_sdk is required for robot replay.")
+    if joint_source not in ("current", "next"):
+        raise ValueError("joint_source must be 'current' or 'next'")
     if not replayer.demo:
         log_data_utils("No demo steps found for robot replay.", "warning")
         return
     if not robot.wait_for_control_ready(1000):
         raise RuntimeError("Robot control is not ready.")
 
+    _validate_ee7_episode(replayer, joint_source)
+    log_data_utils(
+        "Replaying CartesianImpedance from 7-float EE (pose6 + gripper per arm) "
+        f"(joint_source={joint_source!r}).",
+        "info",
+    )
+
     stream = robot.create_command_stream()
-    q_ref = np.asarray(current_joint_positions, dtype=np.float64).copy()
-    stiffness, torque = make_joint_gains(len(q_ref))
     demo_length = replayer.get_demo_length()
+    hold = dt * 10.0
+    min_t = dt * 1.01
 
     for idx in range(demo_length):
-        target = replayer.build_target_joint_position(
-            step_idx=idx,
-            current_joint_positions=q_ref,
-            joint_names=joint_names,
-            left_prefix=left_prefix,
-            right_prefix=right_prefix,
-            expected_per_arm=expected_per_arm,
+        rk, lk = _resolve_replay_pose6_keys(replayer, idx, joint_source)
+        step = replayer.get_step(idx)
+        vr = np.asarray(DataReplayer._as_float_array(step[rk]), dtype=np.float64).reshape(-1)
+        vl = np.asarray(DataReplayer._as_float_array(step[lk]), dtype=np.float64).reshape(-1)
+        T_right = matrix44_from_pose6(vr[:6])
+        T_left = matrix44_from_pose6(vl[:6])
+        right_builder = (
+            rby.CartesianImpedanceControlCommandBuilder()
+            .set_command_header(rby.CommandHeaderBuilder().set_control_hold_time(hold))
+            .set_minimum_time(min_t)
+            .set_joint_stiffness([80, 80, 80, 80, 80, 80, 40])
+            .set_joint_torque_limit([30] * 7)
+            .add_joint_limit("right_arm_3", -2.6, -0.5)
+            .add_joint_limit("right_arm_5", 0.2, 1.9)
+            .set_stop_joint_position_tracking_error(0)
+            .set_stop_orientation_tracking_error(0)
+            .set_stop_joint_position_tracking_error(0)
+            .set_reset_reference(idx == 0)
         )
-        q_ref = target
-
-        body_cmd = (
-            rby.JointImpedanceControlCommandBuilder()
-            .set_command_header(rby.CommandHeaderBuilder().set_control_hold_time(max(0.1, dt * 5.0)))
-            .set_position(target.tolist())
-            .set_stiffness(stiffness)
-            .set_torque_limit(torque)
-            .set_minimum_time(max(0.05, dt * 1.01))
+        right_builder.add_target(
+            "base",
+            "link_right_arm_6",
+            T_right,
+            2,
+            np.pi * 2,
+            20,
+            np.pi * 80,
+        )
+        left_builder = (
+            rby.CartesianImpedanceControlCommandBuilder()
+            .set_command_header(rby.CommandHeaderBuilder().set_control_hold_time(hold))
+            .set_minimum_time(min_t)
+            .set_joint_stiffness([80, 80, 80, 80, 80, 80, 40])
+            .set_joint_torque_limit([30] * 7)
+            .add_joint_limit("left_arm_3", -2.6, -0.5)
+            .add_joint_limit("left_arm_5", 0.2, 1.9)
+            .set_stop_joint_position_tracking_error(0)
+            .set_stop_orientation_tracking_error(0)
+            .set_stop_joint_position_tracking_error(0)
+            .set_reset_reference(idx == 0)
+        )
+        left_builder.add_target(
+            "base",
+            "link_left_arm_6",
+            T_left,
+            2,
+            np.pi * 2,
+            20,
+            np.pi * 80,
+        )
+        ctrl_builder = (
+            rby.BodyComponentBasedCommandBuilder()
+            .set_right_arm_command(right_builder)
+            .set_left_arm_command(left_builder)
         )
         stream.send_command(
             rby.RobotCommandBuilder().set_command(
-                rby.ComponentBasedCommandBuilder().set_body_command(body_cmd)
+                rby.ComponentBasedCommandBuilder().set_body_command(ctrl_builder)
             )
         )
+        if gripper is not None:
+            rg = float(np.clip(vr[6], 0.0, 1.0))
+            lg = float(np.clip(vl[6], 0.0, 1.0))
+            gripper.set_normalized_target(np.array([rg, lg]))
         if idx % max(1, log_every) == 0:
-            log_data_utils(f"Replay step {idx + 1}/{demo_length}", "info")
+            log_data_utils(f"Replay step {idx + 1}/{demo_length} (ee_keys={rk},{lk})", "info")
         time.sleep(dt)
 
     stream.cancel()

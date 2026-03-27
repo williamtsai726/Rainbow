@@ -19,8 +19,8 @@ collection:
 storage:
   episodes: 2
   base_dir: "/home/nvidia/repo/rby1-examples-vr-teleop/data"
-  task_directory: "reopen_the_drawer"
-  language_instruction: "Reopen the drawer"
+  task_directory: "test"
+  language_instruction: "test"
   teleop_device: "oculus" # ["oculus", "keyboard", "gello", "none"]
   save_format: "json" # ["json", "npy"]
   saver_max_workers: 2

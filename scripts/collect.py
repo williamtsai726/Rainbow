@@ -246,6 +246,7 @@ from omegaconf import OmegaConf
 from camera.realsense_camera import RealSenseCamera, get_device_ids
 from data_utils.data_saver import DataSaver
 from data_utils.data_saver_thread import EpisodeSaverThread
+from data_utils.ee_pose import pose6_from_matrix44
 
 def main(args: argparse.Namespace):
     ids = get_device_ids()
@@ -292,6 +293,7 @@ def main(args: argparse.Namespace):
                                        Settings.vr_control_meta_quest_port, lambda: robot.power_off(".*"))
 
     gripper = None
+    gripper_cmd_target = None
     if not args.no_gripper:
         for arm in ["left", "right"]:
             if not robot.set_tool_flange_output_voltage(arm, 12):
@@ -303,7 +305,8 @@ def main(args: argparse.Namespace):
         time.sleep(0.3)
         gripper.homing()
         gripper.start()
-        gripper.set_normalized_target(np.array([0.0, 0.0]))
+        gripper_cmd_target = np.array([1.0, 1.0], dtype=np.float64)
+        gripper.set_normalized_target(gripper_cmd_target)
 
     pub_thread = threading.Thread(target=publish_gv, args=(socket,), daemon=True)
     pub_thread.start()
@@ -316,6 +319,9 @@ def main(args: argparse.Namespace):
     joint_names = list(SystemContext.robot_model.robot_joint_names)
     left_arm_joint_indices = [i for i, name in enumerate(joint_names) if name.startswith("left_arm")]
     right_arm_joint_indices = [i for i, name in enumerate(joint_names) if name.startswith("right_arm")]
+    # Stable chain order; 16-float buffer: left (7 arm + 1 gripper) + right (7 arm + 1 gripper).
+    left_arm_joint_indices.sort(key=lambda i: joint_names[i])
+    right_arm_joint_indices.sort(key=lambda i: joint_names[i])
 
     if len(left_arm_joint_indices) != 7 or len(right_arm_joint_indices) != 7:
         logging.warning(
@@ -324,16 +330,26 @@ def main(args: argparse.Namespace):
             "Joint extraction may be incorrect."
         )
 
-    def extract_left_right_arm_joints(q_full: np.ndarray) -> np.ndarray:
-        # DataSaver expects a (14,) vector: left[0:7] + right[7:14]
+    def extract_left_right_joint_payload(q_full: np.ndarray) -> np.ndarray:
+        """16 floats: left_joint[8] + right_joint[8]. Gripper scalars: 1=open, 0=close (dataset convention)."""
         left_q = q_full[left_arm_joint_indices]
         right_q = q_full[right_arm_joint_indices]
-        # Defensive slicing: some robot models may expose extra joints; keep the first 7.
         if left_q.shape[0] > 7:
             left_q = left_q[:7]
         if right_q.shape[0] > 7:
             right_q = right_q[:7]
-        return np.concatenate([left_q, right_q]).astype(np.float32)
+        if gripper is not None:
+            g = gripper.get_normalized_target().copy()
+            # Same indexing as teleop: g[0]←right trigger, g[1]←1−left trigger (asymmetric VR).
+            raw_l = float(np.clip(g[1], 0.0, 1.0))
+            raw_r = float(np.clip(g[0], 0.0, 1.0))
+            left_g = float(np.clip(1.0 - raw_l, 0.0, 1.0))
+            right_g = float(np.clip(1.0 - raw_r, 0.0, 1.0))
+        else:
+            right_g, left_g = 0.0, 0.0
+        left8 = np.concatenate([left_q, np.array([left_g], dtype=np.float32)])
+        right8 = np.concatenate([right_q, np.array([right_g], dtype=np.float32)])
+        return np.concatenate([left8, right8]).astype(np.float32)
 
     def move_robot_to_ready_pose():
         # Matches the existing ready pose used in the prior VR-button-based flow.
@@ -363,12 +379,19 @@ def main(args: argparse.Namespace):
                     .set_minimum_time(2)
                 )
             robot.send_command(rby.RobotCommandBuilder().set_command(cbc)).get()
+            if gripper is not None:
+                # Same convention as replay / JSON: 1 = open (Gripper inverts internally).
+                gripper_cmd_target = np.array([1.0, 1.0], dtype=np.float64)
+                gripper.set_normalized_target(gripper_cmd_target)
 
     max_episode_length = int(cfg["collection"]["max_episode_length"])
     episode_frame_count = 0  # raw frames, not observations (observations start on frame 2)
-    prev_capture = None  # last frame observation payload (without next_joint)
+    prev_capture = None  # last frame: cameras only (EE/gripper logged after send_command)
     last_arm_joints = None
     latest_dashboard_cameras = {"left_camera": None, "front_camera": None, "right_camera": None}
+    # 6-DOF wrist poses after send: prev row vs this tick (translation + rotvec, rad).
+    # Per arm: 6-DOF pose + gripper scalar (1=open / 0=close).
+    saved_row_right_ee = saved_row_left_ee = None
 
     next_time = time.monotonic()
     stream = None
@@ -381,7 +404,7 @@ def main(args: argparse.Namespace):
     num_traj = data_saver.traj_count if data_saver.traj_count > 0 else 1
     saver_thread = EpisodeSaverThread(data_saver)
     saver_thread.start()
-    move_robot_to_ready_pose()
+    # move_robot_to_ready_pose()
     while True:
         # logging.info(f"Loop execution time: {time.monotonic() - now:.4f}s")
         now = time.monotonic()
@@ -398,6 +421,12 @@ def main(args: argparse.Namespace):
         right_buttons = right_hand.get("buttons", {})
         right_primary = bool(right_buttons.get("primaryButton", False))
         right_secondary = bool(right_buttons.get("secondaryButton", False))
+        right_side_active = bool(right_buttons.get("grip", 0.0) > 0.8)
+
+        left_hand = SystemContext.vr_state.controller_state.get("hands", {}).get("left", {})
+        left_buttons = left_hand.get("buttons", {})
+        left_side_active = bool(left_buttons.get("grip", 0.0) > 0.8)
+        collect_active = right_side_active or left_side_active
 
         # Rising-edge detection to avoid repeated triggers while holding the button.
         a_rise = right_primary and not right_primary_prev
@@ -419,6 +448,7 @@ def main(args: argparse.Namespace):
             episode_frame_count = 0
             last_arm_joints = None
             latest_dashboard_cameras = {"left_camera": None, "front_camera": None, "right_camera": None}
+            saved_row_right_ee = saved_row_left_ee = None
             continue
 
         if a_rise:
@@ -428,11 +458,11 @@ def main(args: argparse.Namespace):
                 if stream is not None:
                     stream.cancel()
                     stream = None
-                data_saver.reset_buffer()
                 prev_capture = None
                 episode_frame_count = 0
                 last_arm_joints = None
                 latest_dashboard_cameras = {"left_camera": None, "front_camera": None, "right_camera": None}
+                saved_row_right_ee = saved_row_left_ee = None
                 SystemContext.vr_state.is_initialized = True
                 SystemContext.vr_state.is_stopped = False
                 continue
@@ -456,22 +486,25 @@ def main(args: argparse.Namespace):
                 episode_frame_count = 0
                 last_arm_joints = None
                 latest_dashboard_cameras = {"left_camera": None, "front_camera": None, "right_camera": None}
+                saved_row_right_ee = saved_row_left_ee = None
                 move_robot_to_ready_pose()
                 continue
 
-        if "hands" in SystemContext.vr_state.controller_state:
-            if "right" in SystemContext.vr_state.controller_state["hands"]:
+        if "hands" in SystemContext.vr_state.controller_state and gripper is not None:
+            if gripper_cmd_target is None:
+                gripper_cmd_target = np.array(gripper.get_normalized_target(), dtype=np.float64)
+            updated_gripper = False
+            if "right" in SystemContext.vr_state.controller_state["hands"] and right_side_active:
                 right_controller = SystemContext.vr_state.controller_state["hands"]["right"]
-                if gripper is not None:
-                    gripper_target = gripper.get_normalized_target()
-                    gripper_target[0] = right_controller["buttons"]["trigger"]
-                    gripper.set_normalized_target(gripper_target)
-            if "left" in SystemContext.vr_state.controller_state["hands"]:
+                # Keep teleop/dataset convention aligned: trigger 1.0 means open in saved data.
+                gripper_cmd_target[0] = 1.0 - float(right_controller["buttons"]["trigger"])
+                updated_gripper = True
+            if "left" in SystemContext.vr_state.controller_state["hands"] and left_side_active:
                 left_controller = SystemContext.vr_state.controller_state["hands"]["left"]
-                if gripper is not None:
-                    gripper_target = gripper.get_normalized_target()
-                    gripper_target[1] = 1. - left_controller["buttons"]["trigger"]
-                    gripper.set_normalized_target(gripper_target)
+                gripper_cmd_target[1] = 1.0 - float(left_controller["buttons"]["trigger"])
+                updated_gripper = True
+            if updated_gripper:
+                gripper.set_normalized_target(gripper_cmd_target)
 
         if SystemContext.vr_state.joint_positions.size == 0:
             continue
@@ -479,7 +512,7 @@ def main(args: argparse.Namespace):
         if not SystemContext.vr_state.is_initialized:
             continue
 
-        logging.info(f"{SystemContext.vr_state.center_of_mass = }")
+        # logging.info(f"{SystemContext.vr_state.center_of_mass = }")
 
         dyn_state.set_q(SystemContext.vr_state.joint_positions.copy())
         dyn_robot.compute_forward_kinematics(dyn_state)
@@ -500,38 +533,34 @@ def main(args: argparse.Namespace):
         yaw = np.clip(yaw, -np.deg2rad(29), np.deg2rad(29))
         pitch = np.clip(pitch, -np.deg2rad(19), np.deg2rad(89))
 
+        q_arms = extract_left_right_joint_payload(SystemContext.vr_state.joint_positions)
+        last_arm_joints = q_arms
+
         # --- Capture camera + joints for the current frame ---
-        try:
-            q_arms = extract_left_right_arm_joints(SystemContext.vr_state.joint_positions)
-            last_arm_joints = q_arms
+        capture_ok = False
+        if not collect_active:
+            prev_capture = None
+            saved_row_right_ee = saved_row_left_ee = None
+        else:
+            try:
+                left_rgb, _ = cameras["left_camera"].read()
+                front_rgb, _ = cameras["front_camera"].read()
+                right_rgb, _ = cameras["right_camera"].read()
 
-            left_rgb, _ = cameras["left_camera"].read()
-            front_rgb, _ = cameras["front_camera"].read()
-            right_rgb, _ = cameras["right_camera"].read()
+                latest_dashboard_cameras = {
+                    "left_camera": left_rgb,
+                    "front_camera": front_rgb,
+                    "right_camera": right_rgb,
+                }
 
-            latest_dashboard_cameras = {
-                "left_camera": left_rgb,
-                "front_camera": front_rgb,
-                "right_camera": right_rgb,
-            }
-
-            current_capture = {
-                "left_camera_rgb": left_rgb,
-                "right_camera_rgb": right_rgb,
-                "front_camera_rgb": front_rgb,
-                "joint_positions": q_arms,
-            }
-
-            # DataSaver.save_episode_json expects obs[t] and label obs[t+1] via `next_joint`.
-            if prev_capture is not None:
-                obs_next = dict(prev_capture)
-                obs_next["next_joint"] = q_arms
-                data_saver.add_observation(obs_next)
-
-            prev_capture = current_capture
-            episode_frame_count += 1
-        except Exception as exc:
-            logging.warning(f"Frame capture failed: {exc}")
+                current_capture = {
+                    "left_camera_rgb": left_rgb,
+                    "right_camera_rgb": right_rgb,
+                    "front_camera_rgb": front_rgb,
+                }
+                capture_ok = True
+            except Exception as exc:
+                logging.warning(f"Frame capture failed: {exc}")
 
         # Tracking
         if stream is None:
@@ -738,6 +767,28 @@ def main(args: argparse.Namespace):
                 right_reset = False
                 left_reset = False
 
+                T_hi = np.linalg.inv(Settings.T_hand_offset)
+                M_r = (right_T @ T_hi).astype(np.float64)
+                M_l = (left_T @ T_hi).astype(np.float64)
+                new_right_ee = pose6_from_matrix44(M_r)
+                new_left_ee = pose6_from_matrix44(M_l)
+                left_g = float(q_arms[7])
+                right_g = float(q_arms[15])
+                new_right_ee7 = np.concatenate([new_right_ee, np.array([right_g], dtype=np.float64)])
+                new_left_ee7 = np.concatenate([new_left_ee, np.array([left_g], dtype=np.float64)])
+
+                if capture_ok and prev_capture is not None:
+                    obs_next = dict(prev_capture)
+                    if saved_row_right_ee is not None:
+                        obs_next["right_ee"] = saved_row_right_ee.tolist()
+                        obs_next["left_ee"] = saved_row_left_ee.tolist()
+                    obs_next["next_right_ee"] = new_right_ee7.tolist()
+                    obs_next["next_left_ee"] = new_left_ee7.tolist()
+                    data_saver.add_observation(obs_next)
+
+                saved_row_right_ee = new_right_ee7
+                saved_row_left_ee = new_left_ee7
+
                 stream.send_command(
                     rby.RobotCommandBuilder().set_command(
                         rby.ComponentBasedCommandBuilder()
@@ -763,6 +814,10 @@ def main(args: argparse.Namespace):
                 logging.error(e)
                 stream = None
                 exit(1)
+
+        if capture_ok:
+            prev_capture = current_capture
+            episode_frame_count += 1
 
     saver_thread.stop()
     saver_thread.join()

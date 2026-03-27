@@ -2,7 +2,8 @@ import concurrent
 import json
 import logging
 import os
-from re import L
+
+import numpy as np
 import shutil
 import time
 from PIL import Image
@@ -65,23 +66,21 @@ class DataSaver:
         obs_copy['left_rgb'] = obs['left_camera_rgb']
         obs_copy['right_rgb'] = obs['right_camera_rgb']
         obs_copy['front_rgb'] = obs['front_camera_rgb']
-        obs_copy['joint'] = obs['joint_positions']
-        obs_copy['next_joint'] = obs['next_joint']
+        for key in ("right_ee", "left_ee", "next_right_ee", "next_left_ee"):
+            if key in obs and obs[key] is not None:
+                obs_copy[key] = obs[key]
         self.buffer.append(obs_copy)
 
     def save_episode_json(self, buffer, pickle_only=False):
-        if not self.buffer:
-            logger.warning("Empty buffer, no observations to save.")
-
-        logger.info(f"Saving episode {self.traj_count} to {self.save_dir} with {len(buffer)} observations.")
-        if buffer == []:
+        # Use the passed-in buffer only; self.buffer is often already cleared after queueing async save.
+        if not buffer:
             logger.warning("Empty buffer, no observations to save.")
             return
 
+        logger.info(f"Saving episode {self.traj_count} to {self.save_dir} with {len(buffer)} observations.")
+
         img_paths = {}
         task_name = self.instruction
-        joints = [obs["joint"] for obs in buffer]
-        next_joints = [obs["next_joint"] for obs in buffer]
 
         if not pickle_only:
             # save rgb from camera
@@ -113,17 +112,19 @@ class DataSaver:
                     img_paths.setdefault(key, []).extend(paths)
                     # logger.info(f"Saved {len(paths)} images for camera {key}")
 
-            # add action and delta to json
-            # note that raw action is the joint returned by the viser ik, while the other joint is from robot obs
+            # 7 floats per arm: [tx,ty,tz, rx,ry,rz] (rotvec, rad) + gripper (1=open / 0=close).
             json_data = []
-            for i in range(len(joints)):
+            for i in range(len(buffer)):
                 json_data_obs = {
                     'language_instruction': task_name,
-                    'left_joint': str(joints[i][:7].tolist()),
-                    'right_joint': str(joints[i][7:].tolist()),
-                    'next_left_joint': str(next_joints[i][:7].tolist()),
-                    'next_right_joint': str(next_joints[i][7:].tolist())
                 }
+                for key in ("right_ee", "left_ee", "next_right_ee", "next_left_ee"):
+                    if key in buffer[i] and buffer[i][key] is not None:
+                        v = buffer[i][key]
+                        if isinstance(v, str):
+                            json_data_obs[key] = v
+                        else:
+                            json_data_obs[key] = np.asarray(v, dtype=np.float64).reshape(-1).tolist()
 
                 # add image paths to json
                 for j, rgb_key in enumerate(rgb_keys):
