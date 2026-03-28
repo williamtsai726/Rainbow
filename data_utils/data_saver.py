@@ -66,9 +66,8 @@ class DataSaver:
         obs_copy['left_rgb'] = obs['left_camera_rgb']
         obs_copy['right_rgb'] = obs['right_camera_rgb']
         obs_copy['front_rgb'] = obs['front_camera_rgb']
-        for key in ("right_ee", "left_ee", "next_right_ee", "next_left_ee"):
-            if key in obs and obs[key] is not None:
-                obs_copy[key] = obs[key]
+        obs_copy['joint'] = obs['joint_positions']
+        obs_copy['next_joint'] = obs['next_joint']
         self.buffer.append(obs_copy)
 
     def save_episode_json(self, buffer, pickle_only=False):
@@ -112,19 +111,18 @@ class DataSaver:
                     img_paths.setdefault(key, []).extend(paths)
                     # logger.info(f"Saved {len(paths)} images for camera {key}")
 
-            # 7 floats per arm: [tx,ty,tz, rx,ry,rz] (rotvec, rad) + gripper (1=open / 0=close).
+            # 16 floats per row: left 8 (7 arm + gripper) + right 8; gripper 1=open / 0=close.
+            joints = [obs["joint"] for obs in buffer]
+            next_joints = [obs["next_joint"] for obs in buffer]
             json_data = []
             for i in range(len(buffer)):
                 json_data_obs = {
                     'language_instruction': task_name,
+                    'left_joint': str(joints[i][:8].tolist()),
+                    'right_joint': str(joints[i][8:].tolist()),
+                    'next_left_joint': str(next_joints[i][:8].tolist()),
+                    'next_right_joint': str(next_joints[i][8:].tolist()),
                 }
-                for key in ("right_ee", "left_ee", "next_right_ee", "next_left_ee"):
-                    if key in buffer[i] and buffer[i][key] is not None:
-                        v = buffer[i][key]
-                        if isinstance(v, str):
-                            json_data_obs[key] = v
-                        else:
-                            json_data_obs[key] = np.asarray(v, dtype=np.float64).reshape(-1).tolist()
 
                 # add image paths to json
                 for j, rgb_key in enumerate(rgb_keys):

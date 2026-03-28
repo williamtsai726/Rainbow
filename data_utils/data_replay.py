@@ -9,7 +9,6 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 import numpy as np
 from PIL import Image
 
-from data_utils.ee_pose import matrix44_from_pose6
 from data_utils.logging_utils import log_data_utils, log_demo_data_info, log_replay
 
 try:
@@ -171,6 +170,8 @@ class DataReplayer:
     ) -> Tuple[np.ndarray, np.ndarray]:
         left_idx = [i for i, name in enumerate(joint_names) if str(name).startswith(left_prefix)]
         right_idx = [i for i, name in enumerate(joint_names) if str(name).startswith(right_prefix)]
+        left_idx.sort(key=lambda i: joint_names[i])
+        right_idx.sort(key=lambda i: joint_names[i])
         if len(left_idx) < expected_per_arm or len(right_idx) < expected_per_arm:
             raise RuntimeError(
                 f"Invalid joint map for {left_prefix}/{right_prefix}: "
@@ -291,31 +292,31 @@ def replay_camera_episode(
     plt.show(block=False)
 
 
-def _resolve_replay_pose6_keys(replayer: DataReplayer, step_idx: int, joint_source: str) -> Tuple[str, str]:
+def _resolve_replay_joint_keys(replayer: DataReplayer, step_idx: int, joint_source: str) -> Tuple[str, str]:
+    """Return (left_key, right_key) for per-side 8-float rows (7 arm + gripper)."""
     if joint_source == "next":
-        rk, lk = "next_right_ee", "next_left_ee"
-    else:
-        rk, lk = "right_ee", "left_ee"
-    step = replayer.get_step(step_idx)
-    if joint_source == "next" and (rk not in step or lk not in step):
-        return "right_ee", "left_ee"
-    return rk, lk
+        lk, rk = "next_left_joint", "next_right_joint"
+        step = replayer.get_step(step_idx)
+        if lk not in step or rk not in step:
+            return "left_joint", "right_joint"
+        return lk, rk
+    return "left_joint", "right_joint"
 
 
-def _validate_ee7_episode(replayer: DataReplayer, joint_source: str) -> None:
+def _validate_joint_episode(replayer: DataReplayer, joint_source: str) -> None:
     n = replayer.get_demo_length()
     for idx in range(n):
-        rk, lk = _resolve_replay_pose6_keys(replayer, idx, joint_source)
+        lk, rk = _resolve_replay_joint_keys(replayer, idx, joint_source)
         step = replayer.get_step(idx)
-        for key in (rk, lk):
+        for key in (lk, rk):
             if key not in step:
                 raise KeyError(
-                    f"Step {idx} missing '{key}' (7 floats: pose6 + gripper). "
-                    "Episodes must use right_ee/left_ee (+ next_* when using --joint-source next)."
+                    f"Step {idx} missing '{key}' (expected at least 7 arm floats + optional gripper). "
+                    "Episodes must use left_joint/right_joint (+ next_* when using --joint-source next)."
                 )
             v = np.asarray(DataReplayer._as_float_array(step[key]), dtype=np.float64).reshape(-1)
-            if v.size != 7:
-                raise ValueError(f"Step {idx} '{key}' must have 7 floats, got {v.size}")
+            if v.size < 7:
+                raise ValueError(f"Step {idx} '{key}' must have at least 7 arm floats, got {v.size}")
 
 
 def replay_robot_episode(
@@ -326,11 +327,12 @@ def replay_robot_episode(
     log_every: int = 50,
     gripper: Any = None,
 ):
-    """Replay arms from JSON using 7 floats per arm: 6-DOF wrist pose + gripper.
+    """Replay arms from JSON using 8 floats per side: 7 arm joints + gripper (1=open / 0=close).
 
-    Each of ``right_ee`` / ``left_ee`` (or ``next_right_ee`` / ``next_left_ee`` when
-    ``joint_source=='next'``) is ``[tx, ty, tz, rx, ry, rz, g]``: translation, rotation
-    vector (rad), then gripper ``g`` (1=open / 0=close).
+    Uses ``left_joint`` / ``right_joint`` (or ``next_left_joint`` / ``next_right_joint`` when
+    ``joint_source=='next'``). Sends the same command shape as ``scripts/collect.py`` teleop:
+    ``BodyComponentBasedCommandBuilder`` with per-arm ``JointPositionCommandBuilder`` (7 DOF each),
+    not a single full-body joint vector (which the stack may not apply the same way).
     """
     if rby is None:
         raise RuntimeError("rby1_sdk is required for robot replay.")
@@ -342,9 +344,9 @@ def replay_robot_episode(
     if not robot.wait_for_control_ready(1000):
         raise RuntimeError("Robot control is not ready.")
 
-    _validate_ee7_episode(replayer, joint_source)
+    _validate_joint_episode(replayer, joint_source)
     log_data_utils(
-        "Replaying CartesianImpedance from 7-float EE (pose6 + gripper per arm) "
+        "Replaying JointPosition from 8-float arm+gripper rows per side "
         f"(joint_source={joint_source!r}).",
         "info",
     )
@@ -355,55 +357,27 @@ def replay_robot_episode(
     min_t = dt * 1.01
 
     for idx in range(demo_length):
-        rk, lk = _resolve_replay_pose6_keys(replayer, idx, joint_source)
-        step = replayer.get_step(idx)
-        vr = np.asarray(DataReplayer._as_float_array(step[rk]), dtype=np.float64).reshape(-1)
-        vl = np.asarray(DataReplayer._as_float_array(step[lk]), dtype=np.float64).reshape(-1)
-        T_right = matrix44_from_pose6(vr[:6])
-        T_left = matrix44_from_pose6(vl[:6])
+        lk, rk = _resolve_replay_joint_keys(replayer, idx, joint_source)
+        lj, rj = replayer.get_step_arm_joints(idx, left_key=lk, right_key=rk)
+        lj = np.asarray(lj, dtype=np.float64).reshape(-1)
+        rj = np.asarray(rj, dtype=np.float64).reshape(-1)
+        if lj.size < 7 or rj.size < 7:
+            raise ValueError(
+                f"Step {idx}: need at least 7 arm values per side; got left={lj.size} right={rj.size}"
+            )
+        lu, ru = lj[:7], rj[:7]
+
         right_builder = (
-            rby.CartesianImpedanceControlCommandBuilder()
+            rby.JointPositionCommandBuilder()
             .set_command_header(rby.CommandHeaderBuilder().set_control_hold_time(hold))
             .set_minimum_time(min_t)
-            .set_joint_stiffness([80, 80, 80, 80, 80, 80, 40])
-            .set_joint_torque_limit([30] * 7)
-            .add_joint_limit("right_arm_3", -2.6, -0.5)
-            .add_joint_limit("right_arm_5", 0.2, 1.9)
-            .set_stop_joint_position_tracking_error(0)
-            .set_stop_orientation_tracking_error(0)
-            .set_stop_joint_position_tracking_error(0)
-            .set_reset_reference(idx == 0)
-        )
-        right_builder.add_target(
-            "base",
-            "link_right_arm_6",
-            T_right,
-            2,
-            np.pi * 2,
-            20,
-            np.pi * 80,
+            .set_position(ru.tolist())
         )
         left_builder = (
-            rby.CartesianImpedanceControlCommandBuilder()
+            rby.JointPositionCommandBuilder()
             .set_command_header(rby.CommandHeaderBuilder().set_control_hold_time(hold))
             .set_minimum_time(min_t)
-            .set_joint_stiffness([80, 80, 80, 80, 80, 80, 40])
-            .set_joint_torque_limit([30] * 7)
-            .add_joint_limit("left_arm_3", -2.6, -0.5)
-            .add_joint_limit("left_arm_5", 0.2, 1.9)
-            .set_stop_joint_position_tracking_error(0)
-            .set_stop_orientation_tracking_error(0)
-            .set_stop_joint_position_tracking_error(0)
-            .set_reset_reference(idx == 0)
-        )
-        left_builder.add_target(
-            "base",
-            "link_left_arm_6",
-            T_left,
-            2,
-            np.pi * 2,
-            20,
-            np.pi * 80,
+            .set_position(lu.tolist())
         )
         ctrl_builder = (
             rby.BodyComponentBasedCommandBuilder()
@@ -416,11 +390,11 @@ def replay_robot_episode(
             )
         )
         if gripper is not None:
-            rg = float(np.clip(vr[6], 0.0, 1.0))
-            lg = float(np.clip(vl[6], 0.0, 1.0))
+            lg = float(np.clip(lj[7], 0.0, 1.0)) if lj.size > 7 else 0.0
+            rg = float(np.clip(rj[7], 0.0, 1.0)) if rj.size > 7 else 0.0
             gripper.set_normalized_target(np.array([rg, lg]))
         if idx % max(1, log_every) == 0:
-            log_data_utils(f"Replay step {idx + 1}/{demo_length} (ee_keys={rk},{lk})", "info")
+            log_data_utils(f"Replay step {idx + 1}/{demo_length} (joint_keys={lk},{rk})", "info")
         time.sleep(dt)
 
     stream.cancel()

@@ -192,3 +192,10 @@ cython_debug/
 #  refer to https://docs.cursor.com/context/ignore-files
 .cursorignore
 .cursorindexingignore
+
+
+# ignore the data folder
+data/
+
+# Local LeRobot clone (nested repo); use pip or submodule intentionally
+lerobot/

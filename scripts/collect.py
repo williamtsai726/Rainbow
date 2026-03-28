@@ -119,6 +119,30 @@ def connect_rby1(address: str, model: str = "a", no_head: bool = False):
     return robot
 
 
+def _cancel_command_stream(stream) -> None:
+    if stream is None:
+        return
+    try:
+        stream.cancel()
+    except Exception:
+        pass
+
+
+def _send_robot_command_with_stream_retry(robot, stream, robot_cmd):
+    """Send on the command stream; if the SDK reports an expired stream, recreate and retry once."""
+    try:
+        stream.send_command(robot_cmd)
+        return stream
+    except Exception as e:
+        if "expired" not in str(e).lower():
+            raise
+        logging.warning("Command stream expired; recreating and retrying send.")
+        _cancel_command_stream(stream)
+        stream = robot.create_command_stream()
+        stream.send_command(robot_cmd)
+        return stream
+
+
 def setup_meta_quest_udp_communication(local_ip: str, local_port: int, meta_quest_ip: str, meta_quest_port: int,
                                        power_off=None):
     with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
@@ -180,11 +204,9 @@ def handle_vr_button_event(robot: Union[rby.Robot_A, rby.Robot_M], no_head: bool
             cbc = (
                 rby.ComponentBasedCommandBuilder()
                 .set_body_command(
-                    rby.JointImpedanceControlCommandBuilder()
+                    rby.JointPositionCommandBuilder()
                     .set_command_header(rby.CommandHeaderBuilder().set_control_hold_time(1))
                     .set_position(ready_pose)
-                    .set_stiffness([400.] * 6 + [60] * 7 + [60] * 7)
-                    .set_torque_limit([500] * 6 + [30] * 7 + [30] * 7)
                     .set_minimum_time(2)
                 )
             )
@@ -246,7 +268,7 @@ from omegaconf import OmegaConf
 from camera.realsense_camera import RealSenseCamera, get_device_ids
 from data_utils.data_saver import DataSaver
 from data_utils.data_saver_thread import EpisodeSaverThread
-from data_utils.ee_pose import pose6_from_matrix44
+from data_utils.arm_ik import solve_ik_arm_7dof
 
 def main(args: argparse.Namespace):
     ids = get_device_ids()
@@ -364,11 +386,9 @@ def main(args: argparse.Namespace):
             cbc = (
                 rby.ComponentBasedCommandBuilder()
                 .set_body_command(
-                    rby.JointImpedanceControlCommandBuilder()
+                    rby.JointPositionCommandBuilder()
                     .set_command_header(rby.CommandHeaderBuilder().set_control_hold_time(1))
                     .set_position(ready_pose)
-                    .set_stiffness([400.] * 6 + [60] * 7 + [60] * 7)
-                    .set_torque_limit([500] * 6 + [30] * 7 + [30] * 7)
                     .set_minimum_time(2)
                 )
             )
@@ -386,12 +406,9 @@ def main(args: argparse.Namespace):
 
     max_episode_length = int(cfg["collection"]["max_episode_length"])
     episode_frame_count = 0  # raw frames, not observations (observations start on frame 2)
-    prev_capture = None  # last frame: cameras only (EE/gripper logged after send_command)
+    prev_capture = None  # last frame: cameras + joint_positions (commanded 16 floats after IK)
     last_arm_joints = None
     latest_dashboard_cameras = {"left_camera": None, "front_camera": None, "right_camera": None}
-    # 6-DOF wrist poses after send: prev row vs this tick (translation + rotvec, rad).
-    # Per arm: 6-DOF pose + gripper scalar (1=open / 0=close).
-    saved_row_right_ee = saved_row_left_ee = None
 
     next_time = time.monotonic()
     stream = None
@@ -404,7 +421,7 @@ def main(args: argparse.Namespace):
     num_traj = data_saver.traj_count if data_saver.traj_count > 0 else 1
     saver_thread = EpisodeSaverThread(data_saver)
     saver_thread.start()
-    # move_robot_to_ready_pose()
+    move_robot_to_ready_pose()
     while True:
         # logging.info(f"Loop execution time: {time.monotonic() - now:.4f}s")
         now = time.monotonic()
@@ -448,13 +465,12 @@ def main(args: argparse.Namespace):
             episode_frame_count = 0
             last_arm_joints = None
             latest_dashboard_cameras = {"left_camera": None, "front_camera": None, "right_camera": None}
-            saved_row_right_ee = saved_row_left_ee = None
             continue
 
         if a_rise:
             if not SystemContext.vr_state.is_initialized:
                 # Start teleop + data collection.
-                logging.info("Right A pressed. Starting teleop + data collection for episode {num_traj}.")
+                logging.info(f"Right A pressed. Starting teleop + data collection for episode {num_traj}.")
                 if stream is not None:
                     stream.cancel()
                     stream = None
@@ -462,7 +478,6 @@ def main(args: argparse.Namespace):
                 episode_frame_count = 0
                 last_arm_joints = None
                 latest_dashboard_cameras = {"left_camera": None, "front_camera": None, "right_camera": None}
-                saved_row_right_ee = saved_row_left_ee = None
                 SystemContext.vr_state.is_initialized = True
                 SystemContext.vr_state.is_stopped = False
                 continue
@@ -486,7 +501,6 @@ def main(args: argparse.Namespace):
                 episode_frame_count = 0
                 last_arm_joints = None
                 latest_dashboard_cameras = {"left_camera": None, "front_camera": None, "right_camera": None}
-                saved_row_right_ee = saved_row_left_ee = None
                 move_robot_to_ready_pose()
                 continue
 
@@ -507,9 +521,22 @@ def main(args: argparse.Namespace):
                 gripper.set_normalized_target(gripper_cmd_target)
 
         if SystemContext.vr_state.joint_positions.size == 0:
+            # No state updates: if we keep a live stream without sending, the SDK expires it and the next send aborts.
+            if stream is not None:
+                try:
+                    stream.cancel()
+                except Exception:
+                    pass
+                stream = None
             continue
 
         if not SystemContext.vr_state.is_initialized:
+            if stream is not None:
+                try:
+                    stream.cancel()
+                except Exception:
+                    pass
+                stream = None
             continue
 
         # logging.info(f"{SystemContext.vr_state.center_of_mass = }")
@@ -540,7 +567,6 @@ def main(args: argparse.Namespace):
         capture_ok = False
         if not collect_active:
             prev_capture = None
-            saved_row_right_ee = saved_row_left_ee = None
         else:
             try:
                 left_rgb, _ = cameras["left_camera"].read()
@@ -673,10 +699,8 @@ def main(args: argparse.Namespace):
                     left_T = SystemContext.vr_state.left_hand_locked_pose
 
                 if SystemContext.vr_state.is_torso_following:
-                    print('a')
                     diff = np.linalg.inv(
                         SystemContext.vr_state.head_controller_start_pose) @ SystemContext.vr_state.head_controller_current_pose
-                    print(SystemContext.vr_state.head_controller_start_pose)
 
                     T = np.identity(4)
                     T[:3, :3] = SystemContext.vr_state.torso_start_pose[:3, :3]
@@ -684,6 +708,8 @@ def main(args: argparse.Namespace):
                     SystemContext.vr_state.torso_locked_pose = torso_T
                 else:
                     torso_T = SystemContext.vr_state.torso_locked_pose
+
+                T_hi = np.linalg.inv(Settings.T_hand_offset)
 
                 if args.whole_body:
                     ctrl_builder = (
@@ -704,61 +730,54 @@ def main(args: argparse.Namespace):
                         .set_reset_reference(right_reset | left_reset | torso_reset)
                     )
                     ctrl_builder.add_target("base", "link_torso_5", torso_T, 1, np.pi * 0.5, 10, np.pi * 20)
-                    ctrl_builder.add_target("base", "link_right_arm_6", right_T @ np.linalg.inv(Settings.T_hand_offset),
+                    ctrl_builder.add_target("base", "link_right_arm_6", right_T @ T_hi,
                                             2, np.pi * 2, 20, np.pi * 80)
-                    ctrl_builder.add_target("base", "link_left_arm_6", left_T @ np.linalg.inv(Settings.T_hand_offset),
+                    ctrl_builder.add_target("base", "link_left_arm_6", left_T @ T_hi,
                                             2, np.pi * 2, 20, np.pi * 80)
+                    q_cmd_16 = extract_left_right_joint_payload(SystemContext.vr_state.joint_positions.copy())
 
                 else:
-                    torso_builder = (
-                        rby.CartesianImpedanceControlCommandBuilder()
-                        .set_command_header(rby.CommandHeaderBuilder().set_control_hold_time(Settings.dt * 10))
-                        .set_minimum_time(Settings.dt * 1.01)
-                        .set_joint_stiffness([400.] * 6)
-                        .set_joint_torque_limit([500] * 6)
-                        .add_joint_limit("torso_1", -0.523598776, 1.3)
-                        .add_joint_limit("torso_2", -2.617993878, -0.2)
-                        .set_stop_joint_position_tracking_error(0)
-                        .set_stop_orientation_tracking_error(0)
-                        .set_stop_joint_position_tracking_error(0)
-                        .set_reset_reference(torso_reset)
-                    )
+                    q_full = SystemContext.vr_state.joint_positions.copy().astype(np.float64)
+                    T_des_r = (right_T @ T_hi).astype(np.float64)
+                    T_des_l = (left_T @ T_hi).astype(np.float64)
+                    if SystemContext.vr_state.is_right_following:
+                        q_full = solve_ik_arm_7dof(
+                            dyn_robot,
+                            dyn_state,
+                            q_full,
+                            base_link_idx,
+                            link_right_arm_6_idx,
+                            np.asarray(right_arm_joint_indices, dtype=np.int64),
+                            T_des_r,
+                        )
+                    if SystemContext.vr_state.is_left_following:
+                        q_full = solve_ik_arm_7dof(
+                            dyn_robot,
+                            dyn_state,
+                            q_full,
+                            base_link_idx,
+                            link_left_arm_6_idx,
+                            np.asarray(left_arm_joint_indices, dtype=np.int64),
+                            T_des_l,
+                        )
+                    q_cmd_16 = extract_left_right_joint_payload(q_full)
+
+                    right_q = q_full[np.array(right_arm_joint_indices)][:7]
+                    left_q = q_full[np.array(left_arm_joint_indices)][:7]
                     right_builder = (
-                        rby.CartesianImpedanceControlCommandBuilder()
+                        rby.JointPositionCommandBuilder()
                         .set_command_header(rby.CommandHeaderBuilder().set_control_hold_time(Settings.dt * 10))
                         .set_minimum_time(Settings.dt * 1.01)
-                        .set_joint_stiffness([80, 80, 80, 80, 80, 80, 40])
-                        .set_joint_torque_limit([30] * 7)
-                        .add_joint_limit("right_arm_3", -2.6, -0.5)
-                        .add_joint_limit("right_arm_5", 0.2, 1.9)
-                        .set_stop_joint_position_tracking_error(0)
-                        .set_stop_orientation_tracking_error(0)
-                        .set_stop_joint_position_tracking_error(0)
-                        .set_reset_reference(right_reset)
+                        .set_position(right_q.tolist())
                     )
                     left_builder = (
-                        rby.CartesianImpedanceControlCommandBuilder()
+                        rby.JointPositionCommandBuilder()
                         .set_command_header(rby.CommandHeaderBuilder().set_control_hold_time(Settings.dt * 10))
                         .set_minimum_time(Settings.dt * 1.01)
-                        .set_joint_stiffness([80, 80, 80, 80, 80, 80, 40])
-                        .set_joint_torque_limit([30] * 7)
-                        .add_joint_limit("left_arm_3", -2.6, -0.5)
-                        .add_joint_limit("left_arm_5", 0.2, 1.9)
-                        .set_stop_joint_position_tracking_error(0)
-                        .set_stop_orientation_tracking_error(0)
-                        .set_stop_joint_position_tracking_error(0)
-                        .set_reset_reference(left_reset)
+                        .set_position(left_q.tolist())
                     )
-                    torso_builder.add_target("base", "link_torso_5", torso_T, 1, np.pi * 0.5, 10, np.pi * 20)
-                    right_builder.add_target("base", "link_right_arm_6",
-                                             right_T @ np.linalg.inv(Settings.T_hand_offset),
-                                             2, np.pi * 2, 20, np.pi * 80)
-                    left_builder.add_target("base", "link_left_arm_6", left_T @ np.linalg.inv(Settings.T_hand_offset),
-                                            2, np.pi * 2, 20, np.pi * 80)
-
                     ctrl_builder = (
                         rby.BodyComponentBasedCommandBuilder()
-                        # .set_torso_command(torso_builder)
                         .set_right_arm_command(right_builder)
                         .set_left_arm_command(left_builder)
                     )
@@ -767,53 +786,43 @@ def main(args: argparse.Namespace):
                 right_reset = False
                 left_reset = False
 
-                T_hi = np.linalg.inv(Settings.T_hand_offset)
-                M_r = (right_T @ T_hi).astype(np.float64)
-                M_l = (left_T @ T_hi).astype(np.float64)
-                new_right_ee = pose6_from_matrix44(M_r)
-                new_left_ee = pose6_from_matrix44(M_l)
-                left_g = float(q_arms[7])
-                right_g = float(q_arms[15])
-                new_right_ee7 = np.concatenate([new_right_ee, np.array([right_g], dtype=np.float64)])
-                new_left_ee7 = np.concatenate([new_left_ee, np.array([left_g], dtype=np.float64)])
+                if capture_ok:
+                    current_capture["joint_positions"] = q_cmd_16
 
                 if capture_ok and prev_capture is not None:
                     obs_next = dict(prev_capture)
-                    if saved_row_right_ee is not None:
-                        obs_next["right_ee"] = saved_row_right_ee.tolist()
-                        obs_next["left_ee"] = saved_row_left_ee.tolist()
-                    obs_next["next_right_ee"] = new_right_ee7.tolist()
-                    obs_next["next_left_ee"] = new_left_ee7.tolist()
+                    obs_next["next_joint"] = q_cmd_16
                     data_saver.add_observation(obs_next)
 
-                saved_row_right_ee = new_right_ee7
-                saved_row_left_ee = new_left_ee7
-
-                stream.send_command(
-                    rby.RobotCommandBuilder().set_command(
-                        rby.ComponentBasedCommandBuilder()
-                        # .set_head_command(
-                        #     rby.JointPositionCommandBuilder()
-                        #     .set_command_header(rby.CommandHeaderBuilder().set_control_hold_time(Settings.dt * 10))
-                        #     .set_position([float(yaw), float(pitch)])
-                        #     .set_minimum_time(Settings.dt * 1.01)
-                        # )
-                        # .set_mobility_command(
-                        #     rby.SE2VelocityCommandBuilder()
-                        #     .set_command_header(rby.CommandHeaderBuilder().set_control_hold_time(Settings.dt * 10))
-                        #     .set_velocity(-SystemContext.vr_state.mobile_linear_velocity,
-                        #                   -SystemContext.vr_state.mobile_angular_velocity)
-                        #     .set_minimum_time(Settings.dt * 1.01)
-                        # )
-                        .set_body_command(
-                            ctrl_builder
-                        )
+                robot_cmd = rby.RobotCommandBuilder().set_command(
+                    rby.ComponentBasedCommandBuilder()
+                    # .set_head_command(
+                    #     rby.JointPositionCommandBuilder()
+                    #     .set_command_header(rby.CommandHeaderBuilder().set_control_hold_time(Settings.dt * 10))
+                    #     .set_position([float(yaw), float(pitch)])
+                    #     .set_minimum_time(Settings.dt * 1.01)
+                    # )
+                    # .set_mobility_command(
+                    #     rby.SE2VelocityCommandBuilder()
+                    #     .set_command_header(rby.CommandHeaderBuilder().set_control_hold_time(Settings.dt * 10))
+                    #     .set_velocity(-SystemContext.vr_state.mobile_linear_velocity,
+                    #                   -SystemContext.vr_state.mobile_angular_velocity)
+                    #     .set_minimum_time(Settings.dt * 1.01)
+                    # )
+                    .set_body_command(
+                        ctrl_builder
                     )
                 )
+                stream = _send_robot_command_with_stream_retry(robot, stream, robot_cmd)
             except Exception as e:
-                logging.error(e)
+                logging.error("Command stream error: %s", e)
+                if stream is not None:
+                    try:
+                        stream.cancel()
+                    except Exception:
+                        pass
                 stream = None
-                exit(1)
+                continue
 
         if capture_ok:
             prev_capture = current_capture

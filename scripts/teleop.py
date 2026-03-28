@@ -111,6 +111,30 @@ def connect_rby1(address: str, model: str = "a", no_head: bool = False):
     return robot
 
 
+def _cancel_command_stream(stream) -> None:
+    if stream is None:
+        return
+    try:
+        stream.cancel()
+    except Exception:
+        pass
+
+
+def _send_robot_command_with_stream_retry(robot, stream, robot_cmd):
+    """Send on the command stream; if the SDK reports an expired stream, recreate and retry once."""
+    try:
+        stream.send_command(robot_cmd)
+        return stream
+    except Exception as e:
+        if "expired" not in str(e).lower():
+            raise
+        logging.warning("Command stream expired; recreating and retrying send.")
+        _cancel_command_stream(stream)
+        stream = robot.create_command_stream()
+        stream.send_command(robot_cmd)
+        return stream
+
+
 def setup_meta_quest_udp_communication(local_ip: str, local_port: int, meta_quest_ip: str, meta_quest_port: int,
                                        power_off=None):
     with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
@@ -172,11 +196,9 @@ def handle_vr_button_event(robot: Union[rby.Robot_A, rby.Robot_M], no_head: bool
             cbc = (
                 rby.ComponentBasedCommandBuilder()
                 .set_body_command(
-                    rby.JointImpedanceControlCommandBuilder()
+                    rby.JointPositionCommandBuilder()
                     .set_command_header(rby.CommandHeaderBuilder().set_control_hold_time(1))
                     .set_position(ready_pose)
-                    .set_stiffness([400.] * 6 + [60] * 7 + [60] * 7)
-                    .set_torque_limit([500] * 6 + [30] * 7 + [30] * 7)
                     .set_minimum_time(2)
                 )
             )
@@ -301,6 +323,12 @@ def main(args: argparse.Namespace):
                     gripper.set_normalized_target(gripper_target)
 
         if SystemContext.vr_state.joint_positions.size == 0:
+            if stream is not None:
+                try:
+                    stream.cancel()
+                except Exception:
+                    pass
+                stream = None
             continue
 
         if handle_vr_button_event(robot, args.no_head):
@@ -545,31 +573,35 @@ def main(args: argparse.Namespace):
                 right_reset = False
                 left_reset = False
 
-                stream.send_command(
-                    rby.RobotCommandBuilder().set_command(
-                        rby.ComponentBasedCommandBuilder()
-                        # .set_head_command(
-                        #     rby.JointPositionCommandBuilder()
-                        #     .set_command_header(rby.CommandHeaderBuilder().set_control_hold_time(Settings.dt * 10))
-                        #     .set_position([float(yaw), float(pitch)])
-                        #     .set_minimum_time(Settings.dt * 1.01)
-                        # )
-                        # .set_mobility_command(
-                        #     rby.SE2VelocityCommandBuilder()
-                        #     .set_command_header(rby.CommandHeaderBuilder().set_control_hold_time(Settings.dt * 10))
-                        #     .set_velocity(-SystemContext.vr_state.mobile_linear_velocity,
-                        #                   -SystemContext.vr_state.mobile_angular_velocity)
-                        #     .set_minimum_time(Settings.dt * 1.01)
-                        # )
-                        .set_body_command(
-                            ctrl_builder
-                        )
+                robot_cmd = rby.RobotCommandBuilder().set_command(
+                    rby.ComponentBasedCommandBuilder()
+                    # .set_head_command(
+                    #     rby.JointPositionCommandBuilder()
+                    #     .set_command_header(rby.CommandHeaderBuilder().set_control_hold_time(Settings.dt * 10))
+                    #     .set_position([float(yaw), float(pitch)])
+                    #     .set_minimum_time(Settings.dt * 1.01)
+                    # )
+                    # .set_mobility_command(
+                    #     rby.SE2VelocityCommandBuilder()
+                    #     .set_command_header(rby.CommandHeaderBuilder().set_control_hold_time(Settings.dt * 10))
+                    #     .set_velocity(-SystemContext.vr_state.mobile_linear_velocity,
+                    #                   -SystemContext.vr_state.mobile_angular_velocity)
+                    #     .set_minimum_time(Settings.dt * 1.01)
+                    # )
+                    .set_body_command(
+                        ctrl_builder
                     )
                 )
+                stream = _send_robot_command_with_stream_retry(robot, stream, robot_cmd)
             except Exception as e:
-                logging.error(e)
+                logging.error("Command stream error: %s", e)
+                if stream is not None:
+                    try:
+                        stream.cancel()
+                    except Exception:
+                        pass
                 stream = None
-                exit(1)
+                continue
 
         # ...
 

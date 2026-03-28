@@ -17,10 +17,10 @@ collection:
 
 # Data storage configuration
 storage:
-  episodes: 2
+  episodes: 30
   base_dir: "/home/nvidia/repo/rby1-examples-vr-teleop/data"
   task_directory: "test"
-  language_instruction: "test"
+  language_instruction: "Close the oven"
   teleop_device: "oculus" # ["oculus", "keyboard", "gello", "none"]
   save_format: "json" # ["json", "npy"]
   saver_max_workers: 2
@@ -47,5 +47,5 @@ lerobot:
 policy:
   # _target_: lerobot.policies.pi05.configuration_pi05.PI05Config
   type: "pi05"
-  repo_id: "williamtsai726/stack_four_0310"
-  checkpoint_path: "Jiafei1224/pi-05-cube4"
+  repo_id: "williamtsai726/close_the_oven_0326"
+  checkpoint_path: "Jiafei1224/pi-door"

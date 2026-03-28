@@ -115,11 +115,9 @@ def move_robot_to_ready_pose(
         cbc = (
             rby.ComponentBasedCommandBuilder()
             .set_body_command(
-                rby.JointImpedanceControlCommandBuilder()
+                rby.JointPositionCommandBuilder()
                 .set_command_header(rby.CommandHeaderBuilder().set_control_hold_time(1))
                 .set_position(ready_pose)
-                .set_stiffness([400.0] * 6 + [60.0] * 7 + [60.0] * 7)
-                .set_torque_limit([500.0] * 6 + [30.0] * 7 + [30.0] * 7)
                 .set_minimum_time(2)
             )
         )
@@ -174,9 +172,9 @@ def main(args: argparse.Namespace):
     episode_has_gripper = False
     if demo and isinstance(demo[0], dict):
         s0 = demo[0]
-        for _k in ("left_ee", "right_ee", "next_left_ee", "next_right_ee"):
+        for _k in ("left_joint", "right_joint", "next_left_joint", "next_right_joint"):
             _v = s0.get(_k)
-            if _v is not None and np.asarray(_v, dtype=np.float64).reshape(-1).size >= 7:
+            if _v is not None and np.asarray(_v, dtype=np.float64).reshape(-1).size >= 8:
                 episode_has_gripper = True
                 break
     logging.info(
@@ -262,7 +260,7 @@ if __name__ == "__main__":
         type=str,
         choices=["current", "next"],
         default="current",
-        help="Which pose6 keys drive replay: right_ee/left_ee (current) or next_right_ee/next_left_ee (next).",
+        help="Which joint keys drive replay: left_joint/right_joint (current) or next_left_joint/next_right_joint (next).",
     )
 
     main(parser.parse_args())
