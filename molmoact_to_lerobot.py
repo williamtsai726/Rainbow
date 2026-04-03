@@ -42,6 +42,7 @@ Usage example:
         --fps 30
 
     hf upload williamtsai726/close_the_oven_0326 /home/nvidia/repo/rby1-examples-vr-teleop/data/close_the_oven_lerobot_v30 --repo-type=dataset
+    python add_tag.py --repo_id williamtsai726/close_the_oven_0326
 
 You can then train with:
 

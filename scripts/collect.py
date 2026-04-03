@@ -1,5 +1,7 @@
 import argparse
 import logging
+import shutil
+import subprocess
 import zmq
 import time
 import threading
@@ -269,6 +271,118 @@ from camera.realsense_camera import RealSenseCamera, get_device_ids
 from data_utils.data_saver import DataSaver
 from data_utils.data_saver_thread import EpisodeSaverThread
 from data_utils.arm_ik import solve_ik_arm_7dof
+
+
+def run_post_collection_pipeline(cfg: dict) -> None:
+    """Run optional MolmoAct → LeRobot conversion (and optional HF upload) after collection."""
+    storage_cfg = cfg.get("storage", {}) or {}
+    lerobot_cfg = cfg.get("lerobot", {}) or {}
+    auto_convert = bool(lerobot_cfg.get("auto_convert", False))
+    auto_upload = bool(lerobot_cfg.get("auto_upload", False))
+    if not auto_convert and not auto_upload:
+        return
+    if auto_upload and not auto_convert:
+        logging.info(
+            "Skipping post-collection upload because lerobot.auto_convert is false. "
+            "Enable lerobot.auto_convert to run conversion+upload pipeline."
+        )
+        return
+
+    base_dir = Path(storage_cfg["base_dir"]).expanduser()
+    task_directory = storage_cfg["task_directory"]
+    json_data_dir = base_dir / task_directory
+    lerobot_dir = base_dir / f"{task_directory}_lerobot_v30"
+    repo_id = lerobot_cfg.get("hf_repo_id", storage_cfg.get("hf_repo_id"))
+    if auto_upload and not repo_id:
+        raise ValueError(
+            "lerobot.hf_repo_id is required when lerobot.auto_upload is true."
+        )
+
+    converter_script = _REPO_ROOT / "molmoact_to_lerobot.py"
+    if not converter_script.exists():
+        raise FileNotFoundError(f"Converter script not found: {converter_script}")
+    if not json_data_dir.exists():
+        raise FileNotFoundError(f"Collected json directory not found: {json_data_dir}")
+    if lerobot_dir.exists():
+        remove_dir = input(
+            f"The LeRobot output directory {lerobot_dir} already exists. "
+            "Do you want to remove it and continue? (y/n): "
+        ).strip().lower()
+        if remove_dir == "y":
+            shutil.rmtree(lerobot_dir)
+            lerobot_dir.mkdir(parents=True, exist_ok=True)
+            logging.info("Removed and recreated output directory: %s", lerobot_dir)
+        elif remove_dir == "n":
+            logging.info("Conversion canceled by user because output directory already exists.")
+            return
+        else:
+            logging.info("Invalid input. Conversion canceled.")
+            return
+
+    convert_cmd = [
+        sys.executable,
+        str(converter_script),
+        "--data_dir",
+        str(json_data_dir),
+        "--output_dir",
+        str(lerobot_dir),
+        "--repo_id",
+        str(repo_id or "molmoact_v30"),
+        "--fps",
+        str(lerobot_cfg.get("fps", storage_cfg.get("lerobot_fps", cfg.get("hz", 30)))),
+        "--robot_type",
+        str(
+            lerobot_cfg.get(
+                "robot_type", storage_cfg.get("lerobot_robot_type", "molmoact_dual_arm")
+            )
+        ),
+        "--skip_initial_frames",
+        str(lerobot_cfg.get("skip_initial_frames", storage_cfg.get("lerobot_skip_initial_frames", 0))),
+        "--action_mode",
+        str(
+            lerobot_cfg.get(
+                "action_mode", storage_cfg.get("lerobot_action_mode", "next_joint_fields")
+            )
+        ),
+        "--task_instruction",
+        str(storage_cfg.get("language_instruction", "perform the task")),
+        "--sanitize_online_viz_meta",
+        str(
+            int(
+                bool(
+                    lerobot_cfg.get(
+                        "sanitize_online_viz_meta",
+                        storage_cfg.get("sanitize_online_viz_meta", True),
+                    )
+                )
+            )
+        ),
+        "--vcodec",
+        str(lerobot_cfg.get("vcodec", "h264")),
+        "--image_writer_processes",
+        str(int(lerobot_cfg.get("image_writer_processes", 8))),
+        "--image_writer_threads",
+        str(int(lerobot_cfg.get("image_writer_threads", 8))),
+        "--parallel_encoding",
+        str(int(bool(lerobot_cfg.get("parallel_encoding", True)))),
+        "--upload_to_hf",
+        str(int(auto_upload)),
+        "--delete_local_after_upload",
+        str(
+            int(
+                bool(
+                    lerobot_cfg.get(
+                        "delete_local_after_upload",
+                        storage_cfg.get("delete_local_after_upload", True),
+                    )
+                )
+            )
+        ),
+    ]
+    logging.info("Running post-collection pipeline: %s", " ".join(convert_cmd))
+    subprocess.run(convert_cmd, check=True, cwd=str(_REPO_ROOT))
+    logging.info("Post-collection pipeline completed successfully.")
+
 
 def main(args: argparse.Namespace):
     ids = get_device_ids()
@@ -831,6 +945,7 @@ def main(args: argparse.Namespace):
     saver_thread.stop()
     saver_thread.join()
     logging.info("Data collection complete.")
+    run_post_collection_pipeline(cfg)
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="RB-Y1 VR Control Launcher")
